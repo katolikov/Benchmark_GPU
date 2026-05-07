@@ -191,6 +191,158 @@ def _build_dtype_table(graph) -> dict:
     return dt
 
 
+def rewrite_gridsample_border(model_path: str, out_path: str) -> str:
+    """Replace GridSample(padding_mode='border') with Clamp + GridSample(zeros).
+
+    onnx2tf currently only supports `padding_mode='zeros'` — it hard-exits
+    with `ERROR: The current implementation of GridSample supports only
+    mode=['zeros']` for `border` and `reflection`.
+
+    For 'border' the rewrite is mathematically exact: clamp the input
+    grid coordinates so that no sample point reaches out-of-bounds, then
+    use `padding_mode='zeros'`. Since 'zeros' only ever differs from
+    'border' at out-of-bounds samples, and there are none after the
+    clamp, the two are equivalent.
+
+    The clamp range depends on `align_corners`:
+
+      align_corners=1:  grid in [-1, 1] maps to pixel centers [0, W-1].
+                         Clamp to [-1, 1].
+      align_corners=0:  grid in [-1, 1] maps to pixel edges [-0.5, W-0.5].
+                         Clamp to [-1+1/W, 1-1/W] so the sample point
+                         stays in [0, W-1].
+
+    Requires the data tensor's H, W to be static (most vision graphs
+    satisfy this). 'reflection' padding is not handled — it requires
+    arithmetic on the grid, not just clamping; printed as a warning.
+    """
+    import numpy as np
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper, shape_inference
+
+    model = onnx.load(model_path)
+    try:
+        model = shape_inference.infer_shapes(model, strict_mode=False, data_prop=True)
+    except Exception:
+        pass
+    graph = model.graph
+
+    # Static shape lookup from initializers + value_info + IO.
+    shape_of: dict = {}
+    for init in graph.initializer:
+        shape_of[init.name] = [int(d) for d in init.dims]
+    for vi in list(graph.input) + list(graph.value_info) + list(graph.output):
+        s = vi.type.tensor_type.shape
+        if s.dim:
+            shape_of[vi.name] = [
+                d.dim_value if d.dim_value and d.dim_value > 0 else None
+                for d in s.dim
+            ]
+
+    new_nodes: List = []
+    rewrites = 0
+    skipped = 0
+
+    for node in graph.node:
+        if node.op_type != "GridSample":
+            new_nodes.append(node)
+            continue
+
+        attrs = {a.name: a for a in node.attribute}
+        padding_mode = "zeros"
+        if "padding_mode" in attrs:
+            v = attrs["padding_mode"].s
+            padding_mode = v.decode() if isinstance(v, bytes) else v
+        align_corners = attrs["align_corners"].i if "align_corners" in attrs else 0
+
+        if padding_mode == "zeros":
+            new_nodes.append(node)
+            continue
+        if padding_mode == "reflection":
+            print(f"  WARNING: GridSample {node.name or '<unnamed>'}: "
+                  "padding_mode='reflection' is NOT auto-rewritten; onnx2tf "
+                  "will fail unless you patch GridSample.py manually.")
+            skipped += 1
+            new_nodes.append(node)
+            continue
+        if padding_mode != "border":
+            print(f"  WARNING: GridSample {node.name or '<unnamed>'}: "
+                  f"unknown padding_mode='{padding_mode}', leaving as-is")
+            skipped += 1
+            new_nodes.append(node)
+            continue
+
+        # 'border' case — clamp grid to in-bounds.
+        data_input = node.input[0]
+        grid_input = node.input[1]
+        data_shape = shape_of.get(data_input)
+        if (not data_shape or len(data_shape) != 4
+                or any(d is None or d <= 0 for d in data_shape[2:])):
+            print(f"  WARNING: GridSample {node.name or '<unnamed>'}: data shape "
+                  f"{data_shape} is not static (need [N,C,H,W] all known) — "
+                  "can't rewrite 'border' to 'zeros'. onnx2tf will fail.")
+            skipped += 1
+            new_nodes.append(node)
+            continue
+
+        _N, _C, H, W = data_shape
+        if align_corners:
+            lo_x, hi_x = -1.0, 1.0
+            lo_y, hi_y = -1.0, 1.0
+        else:
+            lo_x, hi_x = -1.0 + 1.0 / W, 1.0 - 1.0 / W
+            lo_y, hi_y = -1.0 + 1.0 / H, 1.0 - 1.0 / H
+
+        # Bounds tensors shape (1,1,1,2). Broadcasts vs grid (N, H_out, W_out, 2).
+        lo_init = numpy_helper.from_array(
+            np.array([[[[lo_x, lo_y]]]], dtype=np.float32),
+            name=_make_unique_name(graph, f"{node.name or 'gs'}_lo"))
+        hi_init = numpy_helper.from_array(
+            np.array([[[[hi_x, hi_y]]]], dtype=np.float32),
+            name=_make_unique_name(graph, f"{node.name or 'gs'}_hi"))
+        graph.initializer.extend([lo_init, hi_init])
+
+        clamp_max_out = _make_unique_name(graph, f"{grid_input}_cmx")
+        clamped_out = _make_unique_name(graph, f"{grid_input}_clamped")
+        new_nodes.append(helper.make_node(
+            "Max", inputs=[grid_input, lo_init.name], outputs=[clamp_max_out],
+            name=_make_unique_name(graph, "gs_max"),
+        ))
+        new_nodes.append(helper.make_node(
+            "Min", inputs=[clamp_max_out, hi_init.name], outputs=[clamped_out],
+            name=_make_unique_name(graph, "gs_min"),
+        ))
+
+        # Rebuild the GridSample with padding_mode=zeros.
+        kept_attrs = [
+            a if a.name != "padding_mode"
+            else helper.make_attribute("padding_mode", "zeros")
+            for a in node.attribute
+        ]
+        # If padding_mode was missing entirely, no need to add (zeros = default).
+        new_gs = helper.make_node(
+            "GridSample",
+            inputs=[data_input, clamped_out] + list(node.input[2:]),
+            outputs=list(node.output),
+            name=node.name,
+        )
+        new_gs.attribute.extend(kept_attrs)
+        new_nodes.append(new_gs)
+        rewrites += 1
+
+    if rewrites:
+        del graph.node[:]
+        graph.node.extend(new_nodes)
+        print(f"  rewrote {rewrites} GridSample(border) -> Clamp + GridSample(zeros)")
+    elif skipped == 0:
+        print("  no GridSample(border) nodes found")
+    if skipped:
+        print(f"  WARNING: skipped {skipped} GridSample node(s) (see above)")
+
+    onnx.save(model, out_path)
+    return out_path
+
+
 def force_fp32(model_path: str, out_path: str) -> str:
     """Aggressively strip fp16 / bf16 / fp64 from the ONNX graph.
 
@@ -434,6 +586,12 @@ def main() -> int:
                          "pass. Only useful if you really need those dtypes "
                          "preserved in the .tflite (rare — TFLite supports "
                          "fp32 natively).")
+    ap.add_argument("--keep-gridsample-border", action="store_true",
+                    help="Disable the default GridSample(border) -> Clamp + "
+                         "GridSample(zeros) rewrite. onnx2tf only supports "
+                         "padding_mode='zeros' so leaving 'border' in the "
+                         "graph will fail; only set this if you've patched "
+                         "onnx2tf yourself.")
     # Back-compat alias: --force-fp32 was opt-in before but is now default.
     ap.add_argument("--force-fp32", action="store_true",
                     help="(default-on alias; kept for back-compat)")
@@ -456,28 +614,37 @@ def main() -> int:
     onnx_in = args.onnx
 
     if not args.skip_simplify:
-        print("[1/4] Simplifying ONNX (onnxsim — fold constants)...")
+        print("[1/5] Simplifying ONNX (onnxsim — fold constants)...")
         sim = os.path.join(work_dir, f"{name}.simplified.onnx")
         onnx_in = simplify_onnx(onnx_in, sim)
     else:
-        print("[1/4] Skipping onnxsim (per --skip-simplify)")
+        print("[1/5] Skipping onnxsim (per --skip-simplify)")
 
     if not args.keep_mixed_precision:
-        print("[2/4] Upcasting fp16/bf16/fp64 -> fp32 "
+        print("[2/5] Upcasting fp16/bf16/fp64 -> fp32 "
               "(disable with --keep-mixed-precision)...")
         forced = os.path.join(work_dir, f"{name}.fp32.onnx")
         onnx_in = force_fp32(onnx_in, forced)
     else:
-        print("[2/4] Keeping mixed precision (per --keep-mixed-precision)")
+        print("[2/5] Keeping mixed precision (per --keep-mixed-precision)")
+
+    if not args.keep_gridsample_border:
+        print("[3/5] Rewriting GridSample(border) -> Clamp + GridSample(zeros) "
+              "(disable with --keep-gridsample-border)...")
+        gs = os.path.join(work_dir, f"{name}.gs.onnx")
+        onnx_in = rewrite_gridsample_border(onnx_in, gs)
+    else:
+        print("[3/5] Keeping GridSample padding modes as-is "
+              "(per --keep-gridsample-border)")
 
     if not args.skip_patch:
-        print("[3/4] Patching mixed-dtype binary/variadic ops...")
+        print("[4/5] Patching mixed-dtype binary/variadic ops...")
         patched = os.path.join(work_dir, f"{name}.patched.onnx")
         onnx_in = patch_concat_dtype_mismatch(onnx_in, patched, verbose=args.verbose)
     else:
-        print("[3/4] Skipping dtype patch (per --skip-patch)")
+        print("[4/5] Skipping dtype patch (per --skip-patch)")
 
-    print("[4/4] Converting ONNX -> TFLite via onnx2tf...")
+    print("[5/5] Converting ONNX -> TFLite via onnx2tf...")
     try:
         onnx2tf.convert(
             input_onnx_file_path=onnx_in,
