@@ -76,15 +76,39 @@ def simplify_onnx(model_path: str, out_path: str) -> str:
     return out_path
 
 
-def _make_unique_name(graph, prefix: str) -> str:
-    used = {n.name for n in graph.node}
-    used.update({n.name for n in graph.initializer})
-    used.update({i.name for i in graph.input})
-    used.update({o.name for o in graph.output})
+def _initial_used_names(graph) -> set:
+    """Collect every name in the graph (nodes, initializers, IO, value_info,
+    *and node outputs*) so a fresh unique-name allocator never collides."""
+    used = set()
+    for n in graph.node:
+        if n.name:
+            used.add(n.name)
+        for o in n.output:
+            if o:
+                used.add(o)
+    for it in graph.initializer:
+        if it.name:
+            used.add(it.name)
+    for vi in list(graph.input) + list(graph.output) + list(graph.value_info):
+        if vi.name:
+            used.add(vi.name)
+    return used
+
+
+def _make_unique_name(used: set, prefix: str) -> str:
+    """Return a name that's not in `used` and add it to the set in-place.
+
+    Caller maintains the set across multiple allocations within a single
+    rewrite — re-scanning graph.node each call would miss in-progress new
+    nodes that haven't been spliced back yet, leading to duplicate-name
+    warnings ("[W] Found distinct Nodes that share the same name") from
+    downstream tools (onnxsim / onnx_graphsurgeon).
+    """
     i = 0
     while True:
         cand = f"{prefix}_{i}"
         if cand not in used:
+            used.add(cand)
             return cand
         i += 1
 
@@ -239,6 +263,7 @@ def rewrite_gridsample_border(model_path: str, out_path: str) -> str:
                 for d in s.dim
             ]
 
+    used_names = _initial_used_names(graph)
     new_nodes: List = []
     rewrites = 0
     skipped = 0
@@ -296,21 +321,21 @@ def rewrite_gridsample_border(model_path: str, out_path: str) -> str:
         # Bounds tensors shape (1,1,1,2). Broadcasts vs grid (N, H_out, W_out, 2).
         lo_init = numpy_helper.from_array(
             np.array([[[[lo_x, lo_y]]]], dtype=np.float32),
-            name=_make_unique_name(graph, f"{node.name or 'gs'}_lo"))
+            name=_make_unique_name(used_names, f"{node.name or 'gs'}_lo"))
         hi_init = numpy_helper.from_array(
             np.array([[[[hi_x, hi_y]]]], dtype=np.float32),
-            name=_make_unique_name(graph, f"{node.name or 'gs'}_hi"))
+            name=_make_unique_name(used_names, f"{node.name or 'gs'}_hi"))
         graph.initializer.extend([lo_init, hi_init])
 
-        clamp_max_out = _make_unique_name(graph, f"{grid_input}_cmx")
-        clamped_out = _make_unique_name(graph, f"{grid_input}_clamped")
+        clamp_max_out = _make_unique_name(used_names, f"{grid_input}_cmx")
+        clamped_out = _make_unique_name(used_names, f"{grid_input}_clamped")
         new_nodes.append(helper.make_node(
             "Max", inputs=[grid_input, lo_init.name], outputs=[clamp_max_out],
-            name=_make_unique_name(graph, "gs_max"),
+            name=_make_unique_name(used_names, "gs_max"),
         ))
         new_nodes.append(helper.make_node(
             "Min", inputs=[clamp_max_out, hi_init.name], outputs=[clamped_out],
-            name=_make_unique_name(graph, "gs_min"),
+            name=_make_unique_name(used_names, "gs_min"),
         ))
 
         # Rebuild the GridSample with padding_mode=zeros.
@@ -505,6 +530,7 @@ def patch_concat_dtype_mismatch(model_path: str, out_path: str,
         # General case (all-integer): NumPy-style promotion to widest.
         return max(types, key=lambda t: promote_rank.get(t, 0))
 
+    used_names = _initial_used_names(graph)
     new_nodes: List = []
     patches = 0
 
@@ -534,13 +560,13 @@ def patch_concat_dtype_mismatch(model_path: str, out_path: str,
             if in_dt == target:
                 continue
             in_name = node.input[idx]
-            cast_out = _make_unique_name(graph, f"{in_name}_cast_{target}")
+            cast_out = _make_unique_name(used_names, f"{in_name}_cast_{target}")
             cast_node = helper.make_node(
                 "Cast",
                 inputs=[in_name],
                 outputs=[cast_out],
                 to=target,
-                name=_make_unique_name(graph, "Cast_dtype_patch"),
+                name=_make_unique_name(used_names, "Cast_dtype_patch"),
             )
             new_nodes.append(cast_node)
             new_inputs[idx] = cast_out
