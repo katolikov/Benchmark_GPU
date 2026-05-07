@@ -58,7 +58,7 @@ OVR_INPUTS=()
 OVR_LABEL=""
 OVR_REMOTE_DIR=""
 OVR_SERIAL=""
-OVR_FORCE_FP32=0
+OVR_KEEP_MIXED=0
 OVR_CONVERT_VERBOSE=0
 
 usage() {
@@ -84,9 +84,10 @@ Optional overrides (any of these wins over the config):
   --adb-serial S       ADB serial for the target device.
 
 ONNX -> TFLite conversion (only when --model is .onnx):
-  --force-fp32         Strip fp16/bf16 from the ONNX before conversion
-                       (use when conversion fails with a fp16/fp32 mismatch).
-  --convert-verbose    Print every Cast inserted by the dtype patch.
+  --keep-mixed-precision  Disable the default fp16/bf16/fp64 -> fp32 upcast
+                          (rare — TFLite is fp32 native; only useful for
+                          advanced workflows that explicitly preserve fp16).
+  --convert-verbose       Print every Cast inserted by the dtype patch.
 
 Examples:
   $0 --config examples/configs/tflite_gpu_fp16.json --output-dir results/runs/gpu_fp16
@@ -111,8 +112,9 @@ while [ $# -gt 0 ]; do
         --label)        OVR_LABEL="$2"; shift 2;;
         --remote-dir)   OVR_REMOTE_DIR="$2"; shift 2;;
         --adb-serial)   OVR_SERIAL="$2"; shift 2;;
-        --force-fp32)   OVR_FORCE_FP32=1; shift 1;;
-        --convert-verbose) OVR_CONVERT_VERBOSE=1; shift 1;;
+        --keep-mixed-precision) OVR_KEEP_MIXED=1; shift 1;;
+        --force-fp32)           shift 1;;   # back-compat no-op (now default)
+        --convert-verbose)      OVR_CONVERT_VERBOSE=1; shift 1;;
         -h|--help)      usage;;
         *) echo "unknown arg: $1" >&2; usage;;
     esac
@@ -189,8 +191,8 @@ case "$FRAMEWORK" in
                     PY="$PROJECT_ROOT/.venv-convert/bin/python3"
                 fi
                 CONVERT_FLAGS=()
-                [ "$OVR_FORCE_FP32" = "1" ]       && CONVERT_FLAGS+=(--force-fp32)
-                [ "$OVR_CONVERT_VERBOSE" = "1" ]  && CONVERT_FLAGS+=(--verbose)
+                [ "$OVR_KEEP_MIXED" = "1" ]      && CONVERT_FLAGS+=(--keep-mixed-precision)
+                [ "$OVR_CONVERT_VERBOSE" = "1" ] && CONVERT_FLAGS+=(--verbose)
                 OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES TF_CPP_MIN_LOG_LEVEL=2 \
                     "$PY" "$PROJECT_ROOT/scripts/convert_onnx_to_tflite.py" "$MODEL" "$cache_dir" \
                     --name "$base" "${CONVERT_FLAGS[@]}" 2>&1 | tee -a "$LOG"

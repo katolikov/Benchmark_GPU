@@ -192,65 +192,79 @@ def _build_dtype_table(graph) -> dict:
 
 
 def force_fp32(model_path: str, out_path: str) -> str:
-    """Aggressively strip fp16 / bf16 from the ONNX graph.
+    """Aggressively strip fp16 / bf16 / fp64 from the ONNX graph.
 
-    Use this when the dtype-coercion patch alone isn't enough — most often
-    when onnx2tf re-introduces fp16 internally for a partial-precision
-    model. Effects on the saved model:
+    Default-on for `convert_onnx_to_tflite.py` because TFLite's portable
+    surface is essentially fp32 + int* (fp16 is a GPU-delegate runtime
+    detail, fp64 isn't supported at all). Effects on the saved model:
 
-      * fp16 initializers -> fp32 initializers (lossless upcast)
-      * Cast(to=FLOAT16) / Cast(to=BFLOAT16) -> Cast(to=FLOAT)
-      * graph.input / output / value_info entries with fp16 -> fp32
+      * fp16 / bf16 / fp64 initializers -> fp32 initializers
+        (lossless upcast for fp16/bf16; harmless precision drop for fp64,
+        since TFLite cannot run fp64 anyway)
+      * Cast(to=FLOAT16) / Cast(to=BFLOAT16) / Cast(to=DOUBLE)
+            -> Cast(to=FLOAT)
+      * Constant.value tensors with non-fp32 float dtypes -> fp32
+      * graph.input / output / value_info entries with non-fp32 float -> fp32
 
-    This eliminates every fp16 boundary, so any subsequent fp16/fp32
-    Concat/Div/Mul mismatch literally cannot exist. The performance cost
-    is paid only by the converter — TFLite's GPU delegate will still run
-    in fp16 at runtime when `is_precision_loss_allowed = true`.
+    This eliminates every floating-point dtype boundary, so subsequent
+    Add/Concat/Div/Mul mismatches in the TF graph literally cannot exist.
+    The performance cost is paid only by the converter — TFLite's GPU
+    delegate will still run in fp16 at runtime when
+    `is_precision_loss_allowed = true`.
+
+    Pass `--keep-mixed-precision` to disable this step.
     """
     import onnx
     import numpy as np
     from onnx import TensorProto, numpy_helper
 
+    NON_FP32_FLOATS = {TensorProto.FLOAT16, TensorProto.BFLOAT16, TensorProto.DOUBLE}
+
     model = onnx.load(model_path)
     graph = model.graph
 
-    # 1. Initializers
+    # 1. Initializers (the bulk of the model — weights, biases, ranges).
     converted_inits = 0
     for init in graph.initializer:
-        if init.data_type in (TensorProto.FLOAT16, TensorProto.BFLOAT16):
+        if init.data_type in NON_FP32_FLOATS:
             arr = numpy_helper.to_array(init).astype(np.float32)
             new_init = numpy_helper.from_array(arr, name=init.name)
             init.CopyFrom(new_init)
             converted_inits += 1
 
-    # 2. Cast nodes targeting fp16/bf16 -> retarget to fp32
+    # 2. Cast / Constant nodes.
     converted_casts = 0
+    converted_const = 0
     for node in graph.node:
         if node.op_type == "Cast":
             for attr in node.attribute:
-                if attr.name == "to" and attr.i in (TensorProto.FLOAT16, TensorProto.BFLOAT16):
+                if attr.name == "to" and attr.i in NON_FP32_FLOATS:
                     attr.i = TensorProto.FLOAT
                     converted_casts += 1
                     break
         elif node.op_type == "Constant":
-            # Constant nodes can have a "value" attribute holding a fp16 tensor.
             for attr in node.attribute:
-                if attr.name == "value" and attr.t and attr.t.data_type in (
-                        TensorProto.FLOAT16, TensorProto.BFLOAT16):
+                if attr.name == "value" and attr.t and attr.t.data_type in NON_FP32_FLOATS:
                     arr = numpy_helper.to_array(attr.t).astype(np.float32)
                     attr.t.CopyFrom(numpy_helper.from_array(arr))
-                    converted_inits += 1
+                    converted_const += 1
 
-    # 3. Graph IO / value_info
+    # 3. Graph IO / value_info.
     converted_vi = 0
     for vi_list in (graph.input, graph.output, graph.value_info):
         for vi in vi_list:
-            if vi.type.tensor_type.elem_type in (TensorProto.FLOAT16, TensorProto.BFLOAT16):
+            if vi.type.tensor_type.elem_type in NON_FP32_FLOATS:
                 vi.type.tensor_type.elem_type = TensorProto.FLOAT
                 converted_vi += 1
 
-    print(f"  force-fp32: rewrote {converted_inits} initializer(s), "
-          f"{converted_casts} Cast(to=fp16), {converted_vi} value_info entries")
+    total = converted_inits + converted_casts + converted_const + converted_vi
+    if total:
+        print(f"  force-fp32: rewrote {converted_inits} initializer(s), "
+              f"{converted_casts} Cast(to=fp16/bf16/fp64), "
+              f"{converted_const} Constant value(s), "
+              f"{converted_vi} value_info entries")
+    else:
+        print("  force-fp32: no non-fp32 floats found (model is already pure fp32)")
     onnx.save(model, out_path)
     return out_path
 
@@ -318,6 +332,8 @@ def patch_concat_dtype_mismatch(model_path: str, out_path: str,
         DOUBLE: 70,
     }
 
+    float_types = {FLOAT16, BFLOAT16, FLOAT, DOUBLE}
+
     def _pick_target(op_type: str, in_types: List[int]) -> int:
         types = set(in_types)
         if not types:
@@ -326,11 +342,15 @@ def patch_concat_dtype_mismatch(model_path: str, out_path: str,
         # has higher rank.
         if op_type in ("Concat", "Where") and types == {INT32, INT64}:
             return INT32
-        # FP16 mixed with FP32 → upcast to FP32. Keeps TFLite happy and
-        # avoids silent precision loss.
-        if FLOAT in types and (FLOAT16 in types or BFLOAT16 in types):
+        # ANY float mismatch in the inputs → unify at fp32. TFLite has no
+        # portable fp64 support, fp16/bf16 isn't usable for cross-device
+        # storage. fp32 is the lingua franca; fp16 inference happens at
+        # runtime via the GPU delegate's `is_precision_loss_allowed`.
+        if types & float_types and (
+            len(types & float_types) > 1 or (types - float_types)
+        ):
             return FLOAT
-        # General case: NumPy-style promotion to the widest dtype.
+        # General case (all-integer): NumPy-style promotion to widest.
         return max(types, key=lambda t: promote_rank.get(t, 0))
 
     new_nodes: List = []
@@ -409,10 +429,14 @@ def main() -> int:
                     help="Skip onnxsim constant folding pass")
     ap.add_argument("--skip-patch", action="store_true",
                     help="Skip int32/int64 + fp16/fp32 dtype coercion pass")
+    ap.add_argument("--keep-mixed-precision", action="store_true",
+                    help="Disable the default fp16/bf16/fp64 -> fp32 upcast "
+                         "pass. Only useful if you really need those dtypes "
+                         "preserved in the .tflite (rare — TFLite supports "
+                         "fp32 natively).")
+    # Back-compat alias: --force-fp32 was opt-in before but is now default.
     ap.add_argument("--force-fp32", action="store_true",
-                    help="Strip all fp16/bf16 from the ONNX graph (lossless "
-                         "upcast). Use when dtype-patch isn't enough — onnx2tf "
-                         "occasionally introduces fp16 boundaries internally")
+                    help="(default-on alias; kept for back-compat)")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="Print every Cast inserted by the dtype-patch")
     args = ap.parse_args()
@@ -438,12 +462,13 @@ def main() -> int:
     else:
         print("[1/4] Skipping onnxsim (per --skip-simplify)")
 
-    if args.force_fp32:
-        print("[2/4] Forcing all fp16/bf16 -> fp32...")
+    if not args.keep_mixed_precision:
+        print("[2/4] Upcasting fp16/bf16/fp64 -> fp32 "
+              "(disable with --keep-mixed-precision)...")
         forced = os.path.join(work_dir, f"{name}.fp32.onnx")
         onnx_in = force_fp32(onnx_in, forced)
     else:
-        print("[2/4] Keeping mixed precision as-is (use --force-fp32 to upcast)")
+        print("[2/4] Keeping mixed precision (per --keep-mixed-precision)")
 
     if not args.skip_patch:
         print("[3/4] Patching mixed-dtype binary/variadic ops...")
@@ -464,31 +489,27 @@ def main() -> int:
         )
     except Exception as e:
         msg = str(e)
-        if "don't all match" in msg or "must have the same dtype" in msg:
+        if ("don't all match" in msg or "does not match type" in msg
+                or "must have the same dtype" in msg):
             print()
             print("=" * 68, file=sys.stderr)
             print("CONVERSION FAILED with a dtype-mismatch error.", file=sys.stderr)
-            print("This usually means onnx2tf introduces a fp16 boundary",
+            print("If you ran with --keep-mixed-precision, retry without it:",
                   file=sys.stderr)
-            print("internally that the patch can't reach. Next steps:", file=sys.stderr)
-            print("  1. Re-run with `--force-fp32` — upcasts every fp16/bf16",
+            print("force-fp32 strips every fp16/bf16/fp64 from the graph and",
                   file=sys.stderr)
-            print("     in the ONNX graph to fp32 before conversion. This is",
+            print("usually clears this error class entirely.", file=sys.stderr)
+            print("", file=sys.stderr)
+            print("Other things to try:", file=sys.stderr)
+            print("  - Run with `-v` to see which Casts the patch inserted,",
                   file=sys.stderr)
-            print("     the surest fix for `tf.math.divide / tf.concat / tf.add",
+            print("    then open the failing op in Netron — its op_type may",
                   file=sys.stderr)
-            print("     ... must have the same dtype, got fp16 != fp32` errors.",
+            print("    need adding to `_DTYPE_UNIFY_OPS` in this file.",
                   file=sys.stderr)
-            print("  2. If still failing, run with `-v` to see which Casts the",
+            print("  - Try `--skip-simplify` (sometimes onnxsim re-introduces",
                   file=sys.stderr)
-            print("     patch inserted, then open the failing op in Netron and",
-                  file=sys.stderr)
-            print("     check whether its op_type is in `_DTYPE_UNIFY_OPS`.",
-                  file=sys.stderr)
-            print("  3. As a last resort: --skip-simplify (sometimes onnxsim",
-                  file=sys.stderr)
-            print("     re-introduces a Cast that was earlier folded out).",
-                  file=sys.stderr)
+            print("    a Cast that was earlier folded out).", file=sys.stderr)
             print("=" * 68, file=sys.stderr)
         raise
 
