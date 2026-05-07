@@ -118,7 +118,8 @@ OUT_DIR=$(cd "$OUT_DIR" && pwd)
 LOG="$OUT_DIR/log.txt"
 : > "$LOG"
 
-cfg_get() { jq -r "$1 // empty" "$CONFIG"; }
+CFG_PY="$PROJECT_ROOT/scripts/cfg.py"
+cfg_get() { python3 "$CFG_PY" "$CONFIG" "$1" 2>/dev/null; }
 pick()    { [ -n "${1:-}" ] && echo "$1" || echo "${2:-}"; }
 
 FRAMEWORK=$(pick "$OVR_FRAMEWORK"  "$(cfg_get '.framework')")
@@ -147,7 +148,7 @@ INPUTS=("${OVR_INPUTS[@]}")
 if [ ${#INPUTS[@]} -eq 0 ]; then
     while IFS= read -r line; do
         [ -n "$line" ] && INPUTS+=("$line")
-    done < <(jq -r '(.inputs // [])[]' "$CONFIG")
+    done < <(cfg_get '.inputs[]')
 fi
 
 [ -n "$MODEL"   ] || { echo "model.path missing in config (or --model override)" >&2; exit 1; }
@@ -337,4 +338,4 @@ echo "  output:   $OUT_DIR/output.bin"
 echo "  log:      $OUT_DIR/log.txt"
 echo "  report:   $OUT_DIR/REPORT.md"
 echo "==========================================================="
-echo "$JSON_LINE" | jq '{label, framework, backend, variant, "p50_ms":.inference.p50, "create_ms":.create_ms, "first_inference_ms":.first_inference_ms, cosine: (.vs_ref.cosine // null)}'
+python3 "$CFG_PY" "$OUT_DIR/results.json" summarize

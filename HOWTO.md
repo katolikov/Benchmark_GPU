@@ -2,14 +2,15 @@
 
 ## 0. Prerequisites
 
-- macOS or Linux host with `adb`, `cmake ≥ 3.22`, `bash`, `jq`
+- macOS or Linux host with `adb`, `cmake ≥ 3.22`, `bash`, `python3`
+  (stdlib only — used by `scripts/run_bench.sh` to read JSON configs)
 - Android NDK r27 or newer (export `ANDROID_NDK=...`)
 - Android device connected via ADB, with `arm64-v8a` ABI
 - For the *optional* ONNX→TFLite conversion: Python 3.12 and the deps in
   `requirements-convert.txt` (only needed if you give the runner a `.onnx`)
 
 ```bash
-which adb cmake bash jq          # all should resolve
+which adb cmake bash python3     # all should resolve
 adb devices                      # at least one device shown
 echo $ANDROID_NDK                # path to your NDK
 ```
