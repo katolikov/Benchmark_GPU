@@ -89,22 +89,47 @@ def _make_unique_name(graph, prefix: str) -> str:
         i += 1
 
 
+# Ops that require all (relevant) inputs to share a dtype in TF/TFLite.
+# We only look at these when scanning for mismatches — touching anything
+# else (Cast, Reshape, ...) would be wrong.
+_DTYPE_UNIFY_OPS = {
+    # binary arithmetic
+    "Add", "Sub", "Mul", "Div", "Pow", "Mod",
+    # variadic / reductions across inputs
+    "Min", "Max", "Mean", "Sum",
+    # collection / control-flow
+    "Concat", "Where",
+    # element-wise comparisons (output is bool but inputs must match)
+    "Equal", "Greater", "Less", "GreaterOrEqual", "LessOrEqual",
+    # logical
+    "And", "Or", "Xor",
+    # matmul + Gemm — also dtype-strict in TF
+    "MatMul",
+}
+
+# For most ops, every input participates in dtype unification. Where is the
+# exception: input[0] is the bool condition; only inputs[1:3] should match.
+_UNIFY_INDICES = {
+    "Where": [1, 2],
+}
+
 def patch_concat_dtype_mismatch(model_path: str, out_path: str) -> str:
-    """Insert Cast nodes to coerce int64 inputs of mixed-dtype Concat / Where /
-    If branches to match their siblings.
+    """Insert Cast nodes so any mixed-dtype binary/variadic op has matching
+    input dtypes. Handles two common ONNX→TF stumbling blocks:
 
-    This is the actual fix for the user-reported error::
+      * int32 vs int64 — usually Shape (int64) meeting an int32 constant.
+      * float16 vs float32 — model uses partial fp16 (an FP16 region inside
+        an otherwise FP32 graph); ONNX permits the boundary, TF doesn't.
 
-        TypeError: Tensors in list passed to 'values' of 'ConcatV2' Op have
-        types [int32, int64] that don't all match.
+    For each Concat / Add / Mul / Div / Where / ... node whose participating
+    inputs disagree, insert a Cast on the minority branch:
 
-    Strategy:
-      1. Run shape+type inference on the model.
-      2. For each Concat / Where node, gather the inferred dtypes of its
-         inputs.
-      3. If they disagree AND the disagreement is int32 ↔ int64, insert a
-         Cast node so every input matches the dominant dtype (we pick int32
-         when one branch is int32, since TF tends to prefer int32 for shapes).
+        int32  ↔ int64     →  cast int64 → int32  (TF prefers int32 for shape ops)
+        float16 ↔ float32  →  cast float16 → float32
+        otherwise          →  cast all to the widest type (numpy promotion)
+
+    If we can't infer a dtype for at least one input, leave the node alone —
+    silently doing the wrong thing is worse than letting TF raise.
     """
     import onnx
     from onnx import TensorProto, helper, shape_inference
@@ -135,69 +160,101 @@ def patch_concat_dtype_mismatch(model_path: str, out_path: str) -> str:
     for vi in list(graph.input) + list(graph.value_info) + list(graph.output):
         if vi.type.tensor_type.elem_type:
             _add(vi.name, vi.type.tensor_type.elem_type)
-
-    # Constant nodes — record their output dtype too.
     for n in graph.node:
         if n.op_type == "Constant":
             for attr in n.attribute:
                 if attr.name == "value" and attr.t and attr.t.data_type:
                     _add(n.output[0], attr.t.data_type)
 
-    # Walk nodes; emit a patched node list with Casts injected as needed.
+    # NumPy-style promotion ranks. Higher wins. Special-case: when an op
+    # only mixes int32+int64 the override below picks int32 instead.
+    INT32 = TensorProto.INT32
+    INT64 = TensorProto.INT64
+    FLOAT16 = TensorProto.FLOAT16
+    BFLOAT16 = TensorProto.BFLOAT16
+    FLOAT = TensorProto.FLOAT
+    DOUBLE = TensorProto.DOUBLE
+    promote_rank = {
+        TensorProto.BOOL: 0,
+        TensorProto.UINT8: 10, TensorProto.INT8: 11,
+        TensorProto.UINT16: 20, TensorProto.INT16: 21,
+        TensorProto.UINT32: 30, INT32: 31,
+        TensorProto.UINT64: 40, INT64: 41,
+        BFLOAT16: 50, FLOAT16: 51,
+        FLOAT: 60,
+        DOUBLE: 70,
+    }
+
+    def _pick_target(op_type: str, in_types: List[int]) -> int:
+        types = set(in_types)
+        if not types:
+            return 0
+        # TF expects int32 shape tensors for Concat/Where, even though int64
+        # has higher rank.
+        if op_type in ("Concat", "Where") and types == {INT32, INT64}:
+            return INT32
+        # FP16 mixed with FP32 → upcast to FP32. Keeps TFLite happy and
+        # avoids silent precision loss.
+        if FLOAT in types and (FLOAT16 in types or BFLOAT16 in types):
+            return FLOAT
+        # General case: NumPy-style promotion to the widest dtype.
+        return max(types, key=lambda t: promote_rank.get(t, 0))
+
     new_nodes: List = []
     patches = 0
 
-    INT32 = TensorProto.INT32
-    INT64 = TensorProto.INT64
-
     for node in graph.node:
-        if node.op_type not in ("Concat", "Where"):
+        if node.op_type not in _DTYPE_UNIFY_OPS:
             new_nodes.append(node)
             continue
 
-        in_types = [dtype_of.get(i, 0) for i in node.input]
-        # If we couldn't infer at least one type, leave it alone.
-        if not all(in_types):
+        # Which input indices participate in dtype unification?
+        all_indices = list(range(len(node.input)))
+        unify_idxs = _UNIFY_INDICES.get(node.op_type, all_indices)
+        # Filter out empty optional inputs (ONNX uses "" for "not provided").
+        unify_idxs = [i for i in unify_idxs if i < len(node.input) and node.input[i]]
+
+        in_types = [dtype_of.get(node.input[i], 0) for i in unify_idxs]
+        if not all(in_types) or len(set(in_types)) <= 1:
             new_nodes.append(node)
             continue
 
-        # Only patch the int32 ↔ int64 case. Anything else is a real bug.
-        unique = set(in_types)
-        if unique == {INT32, INT64}:
-            target = INT32   # TF prefers int32 for shape-like tensors
-            new_inputs = []
-            for in_name, in_dt in zip(node.input, in_types):
-                if in_dt == target:
-                    new_inputs.append(in_name)
-                    continue
-                cast_out = _make_unique_name(graph, f"{in_name}_cast_i32")
-                cast_node = helper.make_node(
-                    "Cast",
-                    inputs=[in_name],
-                    outputs=[cast_out],
-                    to=target,
-                    name=_make_unique_name(graph, "Cast_dtype_patch"),
-                )
-                new_nodes.append(cast_node)
-                new_inputs.append(cast_out)
-                _add(cast_out, target)
-                patches += 1
-            patched = helper.make_node(
-                node.op_type,
-                inputs=new_inputs,
-                outputs=list(node.output),
-                name=node.name,
-                **{a.name: helper.get_attribute_value(a) for a in node.attribute},
+        target = _pick_target(node.op_type, in_types)
+        if not target:
+            new_nodes.append(node)
+            continue
+
+        new_inputs = list(node.input)
+        for idx, in_dt in zip(unify_idxs, in_types):
+            if in_dt == target:
+                continue
+            in_name = node.input[idx]
+            cast_out = _make_unique_name(graph, f"{in_name}_cast_{target}")
+            cast_node = helper.make_node(
+                "Cast",
+                inputs=[in_name],
+                outputs=[cast_out],
+                to=target,
+                name=_make_unique_name(graph, "Cast_dtype_patch"),
             )
-            new_nodes.append(patched)
-        else:
-            new_nodes.append(node)
+            new_nodes.append(cast_node)
+            new_inputs[idx] = cast_out
+            _add(cast_out, target)
+            patches += 1
+
+        patched = helper.make_node(
+            node.op_type,
+            inputs=new_inputs,
+            outputs=list(node.output),
+            name=node.name,
+            **{a.name: helper.get_attribute_value(a) for a in node.attribute},
+        )
+        new_nodes.append(patched)
 
     if patches:
-        # rebuild graph node list
         del graph.node[:]
         graph.node.extend(new_nodes)
-        print(f"  inserted {patches} Cast node(s) to fix int32/int64 mismatches")
+        print(f"  inserted {patches} Cast node(s) to fix dtype mismatches")
 
     onnx.save(model, out_path)
     return out_path
@@ -257,21 +314,20 @@ def main() -> int:
             non_verbose=True,
         )
     except Exception as e:
-        # Common message we want to give actionable help on:
         msg = str(e)
-        if "ConcatV2" in msg or "don't all match" in msg:
+        if "don't all match" in msg or "must have the same dtype" in msg:
             print()
             print("=" * 68, file=sys.stderr)
-            print("CONVERSION FAILED with a Concat dtype-mismatch error.", file=sys.stderr)
-            print("Even after onnxsim + the int32/int64 patch, the TF graph still",
+            print("CONVERSION FAILED with a dtype-mismatch error.", file=sys.stderr)
+            print("Even after onnxsim + the type-coercion patch, a TF op still",
                   file=sys.stderr)
-            print("had mismatched dtypes. Possible next steps:", file=sys.stderr)
-            print("  - Try `--skip-simplify` (sometimes onnxsim re-introduces them)",
-                  file=sys.stderr)
-            print("  - Inspect the failing op in Netron and add a Cast manually",
-                  file=sys.stderr)
-            print("  - Pass a `param_replacement_file` to onnx2tf for that op",
-                  file=sys.stderr)
+            print("saw mismatched input dtypes. Possible next steps:", file=sys.stderr)
+            print("  - Try `--skip-simplify` (sometimes onnxsim re-introduces", file=sys.stderr)
+            print("    a Cast that was earlier folded out)", file=sys.stderr)
+            print("  - Try `--skip-patch` to confirm the patch isn't the cause", file=sys.stderr)
+            print("  - Inspect the failing op in Netron, note its op_type", file=sys.stderr)
+            print("    (e.g. 'Div', 'Concat', 'MatMul'), and add it to", file=sys.stderr)
+            print("    `_DTYPE_UNIFY_OPS` in this file if it's missing", file=sys.stderr)
             print("=" * 68, file=sys.stderr)
         raise
 

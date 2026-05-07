@@ -206,7 +206,136 @@ directly:
 # ↑ produces path/to/out_dir/<basename>.tflite
 ```
 
-## 5. Adding a new model
+## 5. Providing your own inputs
+
+By default `bench_tflite` and `bench_mnn` generate input on-device from
+`benchmark.seed` (`std::mt19937_64` + `uniform_real(-1, 1)`), so timing
+measurements never need a host file. For accuracy comparisons or
+production-realistic numbers you'll want **real** inputs.
+
+### 5.1 The expected file format
+
+The bench binaries read **raw little-endian fp32** with **no header**.
+
+```
+file_size_bytes  ==  prod(input_tensor_shape)  *  4
+```
+
+For MobileNetV2 (1x224x224x3 NHWC for TFLite) that's `1*224*224*3*4 = 602112`
+bytes. For a 1x3x224x224 NCHW model it's the same number — only the
+**byte order** differs.
+
+| Framework | Native layout | What `--input` expects |
+|---|---|---|
+| TFLite (LiteRT)  | NHWC | bytes laid out as `[h0w0c0, h0w0c1, ..., h0w0cC-1, h0w1c0, ...]` |
+| MNN              | NCHW | bytes laid out as `[c0 h0w0..hHwW, c1 h0w0..hHwW, ...]` |
+
+Your file must match the *runtime tensor's* layout, not the original
+ONNX layout. (E.g. our MobileNetV2 ONNX is NCHW because it came from
+torchvision; the .tflite produced by tf.keras is NHWC.)
+
+### 5.2 Provide one or more inputs
+
+CLI:
+
+```bash
+scripts/run_bench.sh --config <cfg.json> --output-dir <dir> \
+    --input my_input.bin                          # single tensor
+scripts/run_bench.sh ... --input in0.bin --input in1.bin   # multi-input model
+```
+
+Or in the JSON config:
+
+```json
+{
+  ...
+  "inputs": ["host/path/in0.bin", "host/path/in1.bin"]
+}
+```
+
+Files are pushed to the device as `input_0.bin`, `input_1.bin`, … and the
+bench binary loads `input_0.bin` for the model's first input. (The current
+bench tools support single-input models. For multi-input models, extend
+`bench_tflite.cpp` / `bench_mnn.cpp` — the loop over input tensors is the
+only change.)
+
+### 5.3 Producing a `.bin` from common sources
+
+Use [scripts/make_input_bin.py](scripts/make_input_bin.py) for the typical
+preprocessing flows. It needs `pillow` for image decoding (already in
+`requirements-convert.txt`).
+
+**Image (PNG/JPEG) → ImageNet-normalized NHWC fp32:**
+
+```bash
+.venv-convert/bin/python scripts/make_input_bin.py photo.jpg my_input.bin \
+    --shape 1x224x224x3 --layout NHWC \
+    --scale 0.00392156862 \
+    --mean 0.485,0.456,0.406 --std 0.229,0.224,0.225
+```
+
+**Same image, NCHW layout (for MNN side):**
+
+```bash
+.venv-convert/bin/python scripts/make_input_bin.py photo.jpg my_input_nchw.bin \
+    --shape 1x3x224x224 --layout NCHW \
+    --scale 0.00392156862 \
+    --mean 0.485,0.456,0.406 --std 0.229,0.224,0.225
+```
+
+**Mobilenet-style ([-1, 1] range, no per-channel mean/std):**
+
+```bash
+scripts/make_input_bin.py photo.jpg my_input.bin \
+    --shape 1x224x224x3 --layout NHWC \
+    --scale 0.0078431372 --mean 1,1,1 --std 1,1,1
+```
+
+**An existing NumPy `.npy` whose shape already matches:**
+
+```bash
+scripts/make_input_bin.py existing.npy my_input.bin \
+    --shape 1x3x224x224 --layout NCHW
+```
+
+**A pre-made raw `.bin` (just verify size):**
+
+```bash
+scripts/make_input_bin.py existing.bin my_input.bin \
+    --shape 1x3x224x224 --layout NCHW --no-preprocess
+```
+
+### 5.4 Hand-rolling without the helper
+
+If you don't want to use the helper, any tool that produces row-major
+fp32 bytes works. Two minimal recipes:
+
+```python
+# Python: NumPy already writes in C-order, so .tofile() is correct.
+import numpy as np
+arr = np.random.randn(1, 224, 224, 3).astype(np.float32)   # NHWC
+arr.tofile("my_input.bin")
+```
+
+```bash
+# bash: dd / xxd if you already have the right binary somewhere.
+dd if=raw_floats.dat of=my_input.bin bs=602112 count=1
+```
+
+### 5.5 Verifying
+
+After you push the file, the bench prints a message if the byte count
+doesn't match the model's input tensor:
+
+```
+TFLite: input 600000 B != tensor 602112 B
+```
+
+If it doesn't match, recompute `prod(shape) * 4` and check your layout
+flag. The bench tool's first-run log (`<output-dir>/log.txt`) also dumps
+the resolved input/output shapes for sanity.
+
+## 6. Adding a new model
 
 1. Drop the `.tflite` (or `.onnx`) into `models/`. For MNN, use either an
    `.mnn` directly or convert ONNX with the on-device `MNNConvert`:
@@ -232,7 +361,7 @@ The bench infers the model's input shape and either accepts your `--input`
 file (must match the byte size of `tensor[0]`) or generates random fp32
 data of the right size from the seed.
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -240,12 +369,12 @@ data of the right size from the seed.
 | `cannot locate symbol "_ZN3fmt..." referenced by /system/lib64/libinput.so` | Don't put `/system/lib64` on `LD_LIBRARY_PATH`. The runner already uses `LD_LIBRARY_PATH=.` only. |
 | Cosine vs ref ≪ 1 on MNN CPU | Make sure you're using the `Express::Module` API (this repo does). The older Interpreter API mis-handles MobileNetV2 NCHW→NC4HW4 transitions. |
 | `Module 'onnx2tf' has no attribute 'convert'` | The deprecated `ai-edge-torch` overrode `onnx2tf`. Recreate the venv (see §4). |
-| `TypeError: ... ConcatV2 ... types [int32, int64] that don't all match` | ONNX permits mixed int32/int64 in `Concat` (commonly Shape outputs vs int32 constants); TF doesn't. The converter automatically (a) folds constants via `onnxsim` and (b) inserts `Cast` nodes before any remaining mixed Concat / Where. If your model still trips this, try `--skip-simplify` (sometimes onnxsim re-introduces mismatches) or inspect the failing op in Netron and add a manual Cast. |
+| `TypeError: ... ConcatV2 ... types [int32, int64] don't all match` <br> `TypeError: ... must have the same dtype, got float16 != float32` | ONNX permits mixed dtypes on element-wise ops (`Concat`, `Where`, `Add`, `Sub`, `Mul`, `Div`, `Pow`, `MatMul`, `Min`, `Max`, comparisons, `And/Or/Xor`); TF doesn't. The converter automatically (a) folds constants via `onnxsim`, then (b) runs ONNX shape inference and inserts `Cast` nodes before any remaining mixed-dtype op (int64→int32 for Concat/Where, fp16→fp32 elsewhere). If your model still trips this, try `--skip-simplify`, or open the failing op in Netron — its `op_type` may need to be added to `_DTYPE_UNIFY_OPS` in `scripts/convert_onnx_to_tflite.py`. |
 | `WARNING: linker: Warning: unable to normalize "\/data/local/tmp/..."` | Cosmetic noise from Android's linker, ignore. |
 | `Can't open file:mobilenet_v2.mnn.cache` | First-time MNN GPU runs print this before they create the cache; the next run will be faster. |
 | `TFLite GPU delegate create failed` on Mali < G77 | Older Mali GPUs sometimes require `experimental_flags |= TFLITE_GPU_EXPERIMENTAL_FLAGS_GL_ONLY`. Set `--variant cl` for OpenCL-only. |
 
-## 7. Where to look in the code
+## 8. Where to look in the code
 
 - Add a new TFLite delegate option: [bench/bench_tflite.cpp](bench/bench_tflite.cpp), look for `gpu_opts.inference_priority1`.
 - Add a new MNN backend option: [bench/bench_mnn.cpp](bench/bench_mnn.cpp), see the `MNN::ScheduleConfig` block.
