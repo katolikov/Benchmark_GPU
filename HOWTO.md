@@ -240,6 +240,7 @@ data of the right size from the seed.
 | `cannot locate symbol "_ZN3fmt..." referenced by /system/lib64/libinput.so` | Don't put `/system/lib64` on `LD_LIBRARY_PATH`. The runner already uses `LD_LIBRARY_PATH=.` only. |
 | Cosine vs ref ≪ 1 on MNN CPU | Make sure you're using the `Express::Module` API (this repo does). The older Interpreter API mis-handles MobileNetV2 NCHW→NC4HW4 transitions. |
 | `Module 'onnx2tf' has no attribute 'convert'` | The deprecated `ai-edge-torch` overrode `onnx2tf`. Recreate the venv (see §4). |
+| `TypeError: ... ConcatV2 ... types [int32, int64] that don't all match` | ONNX permits mixed int32/int64 in `Concat` (commonly Shape outputs vs int32 constants); TF doesn't. The converter automatically (a) folds constants via `onnxsim` and (b) inserts `Cast` nodes before any remaining mixed Concat / Where. If your model still trips this, try `--skip-simplify` (sometimes onnxsim re-introduces mismatches) or inspect the failing op in Netron and add a manual Cast. |
 | `WARNING: linker: Warning: unable to normalize "\/data/local/tmp/..."` | Cosmetic noise from Android's linker, ignore. |
 | `Can't open file:mobilenet_v2.mnn.cache` | First-time MNN GPU runs print this before they create the cache; the next run will be faster. |
 | `TFLite GPU delegate create failed` on Mali < G77 | Older Mali GPUs sometimes require `experimental_flags |= TFLITE_GPU_EXPERIMENTAL_FLAGS_GL_ONLY`. Set `--variant cl` for OpenCL-only. |
