@@ -1,0 +1,26 @@
+# build outputs
+build/
+
+# Python venvs
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+
+# bench artifacts
+results/runs/
+results/sweep.log
+results/results.jsonl
+*.cache
+
+# regenerable model artifacts (produced by build_models or convert script)
+models/mobilenet_v2.onnx
+models/mobilenet_v2.onnx.data
+models/input_*.bin
+models/ref_*.bin
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

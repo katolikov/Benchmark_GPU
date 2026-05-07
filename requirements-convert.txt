@@ -1,0 +1,14 @@
+# Optional dependencies — only needed if you supply a .onnx to run_bench.sh
+# (the runner uses scripts/convert_onnx_to_tflite.py to produce a .tflite).
+# Install into an isolated venv: see HOWTO.md §4.
+
+onnx2tf
+onnx
+onnxsim
+sng4onnx
+onnx_graphsurgeon
+tf_keras
+tensorflow==2.18.0
+numpy<2
+psutil
+ml_dtypes>=0.5

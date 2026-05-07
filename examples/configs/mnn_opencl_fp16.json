@@ -1,0 +1,28 @@
+{
+  "framework": "mnn",
+
+  "model": {
+    "path": "models/mobilenet_v2.mnn"
+  },
+
+  "inputs": [],
+
+  "engine": {
+    "backend": "opencl",
+    "variant": "buffer",
+    "threads": 4
+  },
+
+  "benchmark": {
+    "warmup": 5,
+    "runs": 30,
+    "seed": 42
+  },
+
+  "device": {
+    "remote_dir": "bench_run",
+    "adb_serial": ""
+  },
+
+  "label": "mnn_opencl_buffer_fp16"
+}

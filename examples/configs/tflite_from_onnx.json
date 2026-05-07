@@ -1,0 +1,28 @@
+{
+  "framework": "tflite",
+
+  "model": {
+    "path": "models/mobilenet_v2.onnx"
+  },
+
+  "inputs": [],
+
+  "engine": {
+    "backend": "gpu",
+    "variant": "fp16",
+    "threads": 4
+  },
+
+  "benchmark": {
+    "warmup": 5,
+    "runs": 30,
+    "seed": 42
+  },
+
+  "device": {
+    "remote_dir": "bench_run",
+    "adb_serial": ""
+  },
+
+  "label": "tflite_gpu_fp16_from_onnx"
+}
